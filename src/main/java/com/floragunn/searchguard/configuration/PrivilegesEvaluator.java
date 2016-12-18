@@ -35,14 +35,18 @@ import org.elasticsearch.ElasticsearchSecurityException;
 import org.elasticsearch.action.ActionRequest;
 import org.elasticsearch.action.CompositeIndicesRequest;
 import org.elasticsearch.action.IndicesRequest;
+import org.elasticsearch.action.IndicesRequest.Replaceable;
 import org.elasticsearch.action.RealtimeRequest;
 import org.elasticsearch.action.admin.indices.alias.IndicesAliasesAction;
 import org.elasticsearch.action.bulk.BulkAction;
+import org.elasticsearch.action.get.GetRequest;
 import org.elasticsearch.action.get.MultiGetAction;
+import org.elasticsearch.action.get.MultiGetRequest;
 import org.elasticsearch.action.percolate.MultiPercolateAction;
 import org.elasticsearch.action.search.MultiSearchAction;
 import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.support.IndicesOptions;
+import org.elasticsearch.action.support.single.shard.SingleShardRequest;
 import org.elasticsearch.action.termvectors.MultiTermVectorsAction;
 import org.elasticsearch.cluster.ClusterService;
 import org.elasticsearch.cluster.ClusterState;
@@ -533,12 +537,118 @@ public class PrivilegesEvaluator implements ConfigChangeListener {
             request.putHeader(ConfigConstants.SG_FLS_FIELDS, Base64Helper.serializeObject((Serializable) flsFields));
         }
         
+        //default would be true
+        boolean failOnForbidden = false;
+        
+        if(!allowAction && !failOnForbidden) {
+            return reduceRequest(request, action, permitted);
+        }
+
         return allowAction;
     }
 
     
     //---- end evaluate()
     
+    private boolean reduceRequest(ActionRequest request, String action, String[] allowedIndices) {
+
+        if (!action.startsWith("indices:data/read/")) {
+            return false;
+        }
+        
+        System.out.println(action+"  #  "+request.getClass()+" on "+Arrays.toString(allowedIndices));
+
+        if (request instanceof CompositeIndicesRequest) {
+
+            CompositeIndicesRequest cr = (CompositeIndicesRequest) request;
+            List<? extends IndicesRequest> subs = cr.subRequests();
+            for (Iterator iterator = subs.iterator(); iterator.hasNext();) {
+                IndicesRequest indicesRequest = (IndicesRequest) iterator.next();
+                boolean ok = reduceRequest0(indicesRequest, action, allowedIndices);
+                if (!ok) {
+                    return false;
+                }
+            }
+
+        }
+
+        return reduceRequest0(request, action, allowedIndices);
+
+        /*count, 
+        explain, 
+        get, 
+        mget, 
+        get indexed scripts, 
+        more like this, 
+        multi percolate/search/termvector, 
+        percolate, 
+        scroll, 
+        clear_scroll, 
+        search, 
+        suggest, 
+        tv*/
+
+        // composite
+
+        // replaceable
+
+        // readonly
+        // -> mget
+        // -> get
+        // -> msearch
+        // -> search
+
+    }
+    
+    
+    private boolean reduceRequest0(Object request, String action, String[] allowedIndices) {
+
+        System.out.println("    -> "+action+"/"+request.getClass());
+        
+        if (request instanceof CompositeIndicesRequest) {
+            return false;
+        }
+
+        if (request instanceof Replaceable) {
+            Replaceable gr = (Replaceable) request;
+            gr.indices(allowedIndices);
+        } else if (request instanceof SingleShardRequest) {
+            SingleShardRequest gr = (SingleShardRequest) request;
+            String[] indices = gr.indices();
+            String index = gr.index();
+
+            System.out.println(action + "/" + request.getClass());
+
+            if (indices != null && indices.length != 1) {
+                System.out.println("indices: " + Arrays.toString(indices));
+                return false;
+            }
+
+            if (index == null) {
+                System.out.println("index: " + index);
+            } else {
+                if (!index.equals(indices[0])) {
+                    System.out.println("mismatch " + index + "!=" + indices[0]);
+                    return false;
+                }
+            }
+
+            if (!Arrays.asList(allowedIndices).contains(indices[0])) {
+                gr.index("-----------------" + System.currentTimeMillis() + "---");
+            }
+
+        } else if (request instanceof MultiGetRequest.Item) {
+            MultiGetRequest.Item i = (MultiGetRequest.Item) request;
+            i.index("");
+        } else {
+            System.out.println(request.getClass() + " not suported");
+            return false;
+        }
+
+        return true;
+
+    }
+
     public Set<String> mapSgRoles(User user, TransportAddress caller) {
         
         if(user == null) {
