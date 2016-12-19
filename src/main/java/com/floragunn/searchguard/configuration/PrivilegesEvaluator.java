@@ -39,7 +39,6 @@ import org.elasticsearch.action.IndicesRequest.Replaceable;
 import org.elasticsearch.action.RealtimeRequest;
 import org.elasticsearch.action.admin.indices.alias.IndicesAliasesAction;
 import org.elasticsearch.action.bulk.BulkAction;
-import org.elasticsearch.action.get.GetRequest;
 import org.elasticsearch.action.get.MultiGetAction;
 import org.elasticsearch.action.get.MultiGetRequest;
 import org.elasticsearch.action.percolate.MultiPercolateAction;
@@ -48,6 +47,7 @@ import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.support.IndicesOptions;
 import org.elasticsearch.action.support.single.shard.SingleShardRequest;
 import org.elasticsearch.action.termvectors.MultiTermVectorsAction;
+import org.elasticsearch.client.Client;
 import org.elasticsearch.cluster.ClusterService;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.AliasMetaData;
@@ -67,6 +67,7 @@ import com.floragunn.searchguard.action.configupdate.TransportConfigUpdateAction
 import com.floragunn.searchguard.auditlog.AuditLog;
 import com.floragunn.searchguard.support.Base64Helper;
 import com.floragunn.searchguard.support.ConfigConstants;
+import com.floragunn.searchguard.support.ReflectionHelper;
 import com.floragunn.searchguard.support.WildcardMatcher;
 import com.floragunn.searchguard.user.User;
 import com.google.common.collect.ArrayListMultimap;
@@ -91,12 +92,15 @@ public class PrivilegesEvaluator implements ConfigChangeListener {
     private final Map<Class<?>, Method> typesCache = Collections.synchronizedMap(new HashMap<Class<?>, Method>(100));
     private final String[] deniedActionPatterns;
     private final AuditLog auditLog;
-
+    private final Settings settings;
+    private final Client client;
+    private Interceptor inc = null;
+    
     private final String searchguardIndex;
     
     @Inject
     public PrivilegesEvaluator(final ClusterService clusterService, final TransportConfigUpdateAction tcua, final ActionGroupHolder ah,
-            final IndexNameExpressionResolver resolver, AuditLog auditLog, final Settings settings) {
+            final IndexNameExpressionResolver resolver, AuditLog auditLog, final Settings settings, final Client client) {
         super();
         tcua.addConfigChangeListener(ConfigurationService.CONFIGNAME_ROLES_MAPPING, this);
         tcua.addConfigChangeListener(ConfigurationService.CONFIGNAME_ROLES, this);
@@ -106,6 +110,8 @@ public class PrivilegesEvaluator implements ConfigChangeListener {
         this.resolver = resolver;
         this.auditLog = auditLog;
         this.searchguardIndex = settings.get(ConfigConstants.SG_CONFIG_INDEX, ConfigConstants.SG_DEFAULT_CONFIG_INDEX);
+        this.settings = settings;
+        this.client = client;
         
         /*
         indices:admin/template/delete
@@ -148,6 +154,17 @@ public class PrivilegesEvaluator implements ConfigChangeListener {
         
         deniedActionPatterns = deniedActionPatternsList.toArray(new String[0]);
         
+        
+        if (ReflectionHelper.canLoad("com.floragunn.searchguard.configuration.SearchGuardKibanaInterceptor")) {
+
+            try {
+                inc = (Interceptor) ReflectionHelper.load("com.floragunn.searchguard.configuration.SearchGuardKibanaInterceptor")
+                        .newInstance();
+            } catch (Exception e) {
+                log.error("Unable to load interceptor class due to {}", e, e.toString());
+            }
+
+        }
     }
 
     @Override
@@ -175,7 +192,7 @@ public class PrivilegesEvaluator implements ConfigChangeListener {
 
     }
     
-    private static class IndexType {
+    static class IndexType {
         
         private String index;
         private String type;
@@ -224,7 +241,15 @@ public class PrivilegesEvaluator implements ConfigChangeListener {
         @Override
         public String toString() {
             return "IndexType [index=" + index + ", type=" + type + "]";
-        }        
+        }
+
+        String getIndex() {
+            return index;
+        }
+
+        String getType() {
+            return type;
+        }
     }
 
     public boolean evaluate(final User user, final String action, final ActionRequest<?> request) {
@@ -303,10 +328,17 @@ public class PrivilegesEvaluator implements ConfigChangeListener {
             log.debug("mapped roles: {}", sgRoles);
         }
         
+        if(inc != null && config.getAsBoolean("searchguard.dynamic.kibana.multitenancy_enabled", false)) {
+            //tenant is the user for now
+            inc.applyMultiTenancy(request, user, user.getName(), action, requestedResolvedIndices, config, client);
+        }
+        
         boolean allowAction = false;
         
         final Map<String,Set<String>> dlsQueries = new HashMap<String, Set<String>>();
         final Map<String,Set<String>> flsFields = new HashMap<String, Set<String>>();
+        
+        final Set<IndexType> indexTypesK = new HashSet<PrivilegesEvaluator.IndexType>();
 
         for (final Iterator<String> iterator = sgRoles.iterator(); iterator.hasNext();) {
             final String sgRole = (String) iterator.next();
@@ -474,6 +506,8 @@ public class PrivilegesEvaluator implements ConfigChangeListener {
                     resolvedRoleIndices.put(sgRole, permittedAliasesIndex);
                 }
                 
+               
+                
             }// end loop permittedAliasesIndices
 
             
@@ -523,6 +557,9 @@ public class PrivilegesEvaluator implements ConfigChangeListener {
                 allowAction = true;
             }
 
+            indexTypesK.addAll(_requestedResolvedIndexTypes);
+            
+            
         } // end sg role loop
 
         if (!allowAction && log.isInfoEnabled()) {
@@ -536,12 +573,9 @@ public class PrivilegesEvaluator implements ConfigChangeListener {
         if(!flsFields.isEmpty()) {
             request.putHeader(ConfigConstants.SG_FLS_FIELDS, Base64Helper.serializeObject((Serializable) flsFields));
         }
-        
-        //default would be true
-        boolean failOnForbidden = false;
-        
-        if(!allowAction && !failOnForbidden) {
-            return reduceRequest(request, action, permitted);
+                
+        if(inc != null && !allowAction && config.getAsBoolean("searchguard.dynamic.kibana.do_not_fail_on_forbidden", false)) {
+            return inc.applyIndexReduce(request, action, indexTypesK, clusterState, resolver);
         }
 
         return allowAction;
