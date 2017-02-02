@@ -160,8 +160,8 @@ public class SearchGuardAdmin {
         
         String hostname = "localhost";
         int port = 9300;
-        String kspass = "changeit";
-        String tspass = kspass;
+        String kspass = System.getenv("SG_KS_PASS") != null ? System.getenv("SG_KS_PASS") : "changeit";
+        String tspass = System.getenv("SG_TS_PASS") != null ? System.getenv("SG_TS_PASS") : kspass;
         String cd = ".";
         String ks;
         String ts;
